@@ -864,7 +864,7 @@ class Geodesic_sphere:
         obj.addProperty("App::PropertyLength","Radius","Geodesic","Radius of the sphere").Radius=radius
         obj.addProperty("App::PropertyLength","Side","Geodesic","Sidelength of the triangles (approximative!)")
         obj.addProperty("App::PropertyInteger","DividedBy","Geodesic","The sides of the basic polyhedron are divided in ... (value 1 to 10)").DividedBy = div
-
+        obj.addProperty("App::PropertyBool","Dual","Geodesic","Create the dual of the geodesic sphere (aka Goldberg polyhedron)").Dual = False
         obj.Proxy = self
 
     
@@ -885,26 +885,60 @@ class Geodesic_sphere:
             for pt in range(level+1):
                 icosaPt[str(l1*10+2+pt)] = icosaPt[str(l1*10+1)] + vector2 *(pt+1)
                     
+        for ico in icosaPt.values():
+            ico.normalize().multiply(self.radiusvalue) # In-place modification!
         
         for level in range(self.divided_by):
 
             for point in range(level+1):
-                vertex1x = icosaPt[str(level*10+1+point)].normalize().multiply(self.radiusvalue)
-                vertex2x = icosaPt[str(level*10+11+point)].normalize().multiply(self.radiusvalue)
-                vertex3x = icosaPt[str(level*10+12+point)].normalize().multiply(self.radiusvalue)
-                polygon = Part.makePolygon([vertex1x,vertex2x,vertex3x, vertex1x])
-                faces.append(Part.Face(polygon))
+                vertex1x = icosaPt[str(level*10+1+point)]
+                vertex2x = icosaPt[str(level*10+11+point)]
+                vertex3x = icosaPt[str(level*10+12+point)]
+                faces.append((vertex1x,vertex2x,vertex3x))
 
             for point in range(level):
-                vertex1x = icosaPt[str(level*10+1+point)].normalize().multiply(self.radiusvalue)
-                vertex2x = icosaPt[str(level*10+2+point)].normalize().multiply(self.radiusvalue)
-                vertex3x = icosaPt[str(level*10+12+point)].normalize().multiply(self.radiusvalue)
-                polygon = Part.makePolygon([vertex1x,vertex2x,vertex3x, vertex1x])
-                faces.append(Part.Face(polygon))
+                vertex1x = icosaPt[str(level*10+1+point)]
+                vertex2x = icosaPt[str(level*10+2+point)]
+                vertex3x = icosaPt[str(level*10+12+point)]
+                faces.append((vertex1x,vertex2x,vertex3x))
       
         return faces
 
-         
+    def dual(self,faces):
+        vd = dict()
+        dvd = dict()
+        for f in faces:
+            fxyz = frozenset(tuple(round(xyz,10) for xyz in v) for v in f)
+            for vxyz in fxyz:
+                vd.setdefault(vxyz,set()).add(fxyz)
+            n1,n2,n3 = [Base.Vector(v).normalize() for v in f] # We have to create a new Vector since normalize() modifies in-place
+            dv = (n1.cross(n2) + n2.cross(n3) + n3.cross(n1))/n1.dot(n2.cross(n3))
+            dvd[fxyz] = dv
+        dvmax = max(v.Length for v in dvd.values())
+        for v in dvd.values(): v.multiply(self.radiusvalue/dvmax)
+        faces = []
+        for vxyz,fs in vd.items():
+            # We build a dual face for each vertex, using the dual vertex positions of the faces attached to the vertex. 
+            # For each vertex we collected a set of faces above which we now bring into a proper sequence.
+            fl = [fs.pop()]
+            while fs:
+                vs = set(fl[-1])
+                vs.remove(vxyz) # We want to find a face in the remaining set of faces that shares a second vertex with the previous face
+                fxyz = None
+                for fxyz2 in fs:
+                    if any(vxyz in vs for vxyz in fxyz2):
+                        fxyz = fxyz2
+                        break
+                if fxyz is None: break
+                fs.remove(fxyz)
+                fl.append(fxyz)
+            if fs:
+                print("Error: Failed to bring faces attached to vertex %s in sequence"%str(vxyz))
+            else:
+                nv = tuple(dvd[fxyz] for fxyz in fl)
+                faces.append(nv)
+        return faces
+
 
     def execute (self,obj):
 
@@ -921,11 +955,11 @@ class Geodesic_sphere:
             obj.Side = geodesic_radius2side(radius, self.divided_by)
             self.radiusvalue = radius
         else:
-            self.radiusvalue = geodesic_side2radius(obj.Side,self.divided_by)
+            self.radiusvalue = geodesic_side2radius(float(obj.Side),self.divided_by)
             obj.Radius = self.radiusvalue
             radius = self.radiusvalue
             
-        self.divided_by = obj.DividedBy   
+        self.divided_by = int(obj.DividedBy)
 
         z = 4*radius / math.sqrt(10 + 2 * math.sqrt(5))
         anglefaces = 138.189685104
@@ -957,10 +991,12 @@ class Geodesic_sphere:
         for i in range(5):
             faces = self.geodesic_divide_triangles(vertex_top,vertexes_high[i],vertexes_high[i+1],faces)
     
-        
-        shell = Part.makeShell(faces)
-        solid = Part.makeSolid(shell)
-        obj.Shape = solid        
+        if obj.Dual:
+            faces = self.dual(faces)
+
+        faceshapes = tuple(Part.Face(Part.makePolygon(f+f[:1])) for f in faces)
+        obj.Shape = Part.makeShell(faceshapes)
+        obj.Shape = Part.makeSolid(obj.Shape)
  
    
 class GeodesicSphereCommand:
@@ -1397,13 +1433,17 @@ class RegularSolid:
                 obj.Source = [e[1] for e in self.enums["Source"] if e[0]==source][0]
                 obj.Vtrunc,obj.Etrunc,obj.Dual = vtrunc,etrunc,dual
                 obj.Snub = [e[1] for e in self.enums["Snub"] if e[0]==snub][0]
-        else: # The preset is as it was, or it was set to "Custom". Check if the user has changed a parameter affecting the preset
+        else: # The preset is as it was, or it was set to "Custom". Check if the construction exactly matches a given preset.
             source = [e[0] for e in self.enums["Source"] if e[1]==obj.Source][0]
-            vtrunc,etrunc,dual = obj.Vtrunc,obj.Etrunc,obj.Dual
+            vtrunc = float(obj.Vtrunc)
+            etrunc = float(obj.Etrunc)
+            dual = 1 if obj.Dual else 0
             snub = [e[0] for e in self.enums["Snub"] if e[1]==obj.Snub][0]
-            if presetcode!="0" and self.p[presetcode]!=(source,vtrunc,etrunc,dual,snub):
-                presetcode = "0" if (presetcode[0]=="d")==dual else "d"+presetcode if dual else presetcode[1:]
-                obj.Presets = [e[1] for e in self.enums["Presets"] if e[0]==presetcode][0]
+            current = [source,vtrunc,etrunc,dual,snub]
+            for e in reversed(self.enums["Presets"]):
+                if e[0]=="0" or self.p[e[0]]==current:
+                    presetcode,obj.Presets = e[:2]
+                    break
         self.prevcode = presetcode
         
         bpy_verts,bpy_faces = createSolid(source,vtrunc,etrunc,dual,snub)
